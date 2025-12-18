@@ -1,4 +1,4 @@
-# 4580-Final-Project: Project Title: Modeling LLM-Query Serving Systems
+# 4580-Final-Project: Modeling LLM-Query Serving Systems
 ## Authors: Darcy del Real, Alex Gardocki, Joonseok Jung, Rishi Kumar, Anurag Yadav
 ## Description: 
 
