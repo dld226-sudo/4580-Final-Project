@@ -26,20 +26,20 @@ The simulation will display progress updates every 10% completion and generate C
 
 ---
 ##  Usage: 
-The simulation runs with the following default parameters:
+The simulation runs with the following parameters:
 
-1) pythonmean_marginal_cost = 0.3        # Cost per token (ms)
-2) mean_fixed_cost = 45.5          # Fixed batch overhead (ms)
-3) min_batch_threshold = 64        # Minimum tokens for efficient batching
-4) max_batch_size = 200            # Maximum tokens per batch
-5) query_arrival_rate = 1/1000     # Queries per millisecond (1 per second)
-6) num_workers = 10                # Number of GPU workers
-7) chunk_size = 10                 # Prefill chunk size (ChunkedScheduler only)
-8) replications = 100              # Number of simulation trials
-9) num_events_to_simulate = 30000  # Events per trial
+1) pythonmean_marginal_cost        # Cost per token (ms)
+2) mean_fixed_cost                 # Fixed batch overhead (ms)
+3) min_batch_threshold             # Minimum tokens for efficient batching
+4) max_batch_size                  # Maximum tokens per batch
+5) query_arrival_rate              # Queries per millisecond (1 per second)
+6) num_workers                     # Number of GPU workers
+7) chunk_size                      # Prefill chunk size (ChunkedScheduler only)
+8) replications                    # Number of simulation trials
+9) num_events_to_simulate          # Events per trial
 
 Customizing Parameters:
-To modify simulation parameters, edit the values in the main() function of simulation.py.
+To modify simulation parameters, input the values in the when prompted in running of simulation.py.
 
 ## Understanding the Simulation
 Query Generation: Queries arrive according to a Poisson process with randomly generated:
