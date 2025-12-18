@@ -23,6 +23,7 @@ class Query:
         self.decoded: int = 0
         # Number of prefill tokens currently being processed
         self.prefilling_in_progress: int = 0
+        self.decode_in_progress: bool = False
 
     def __repr__(self) -> str:
         return f"Query(prompt_length={self.prompt_length}, token_budget={self.token_budget})"
@@ -79,6 +80,7 @@ class Query:
             raise RuntimeError("Cannot decode until prefill phase is complete")
 
         self.decoded += 1
+        self.decode_in_progress = False
 
         # Update TBT
         self.time_between_tokens.append(cur_time - self.arrival_time - self.time_to_first_token - sum(self.time_between_tokens))
@@ -139,6 +141,10 @@ class Worker:
         # Update number of prefill tokens in progress
         if phase == 'prefill':
             query.prefilling_in_progress += tokens_planned
+        elif phase == 'decode':
+            if query.decode_in_progress:
+                raise RuntimeError("Query already has decode in progress")
+            query.decode_in_progress = True
 
         self.total_tokens += tokens_planned
         self.processing_queries.append({'query': query, 'phase': phase, 'tokens_planned': tokens_planned})
@@ -334,10 +340,75 @@ class ChunkedScheduler(Scheduler):
         Iterate through workers and assign tasks to idle ones. Prioritize processing decodes,
         then ongoing prefill chunks, and finally new prefill chunks.
         """
-        self._distribute_decodes()
-        self._distribute_ongoing_prefills()
-        self._distribute_new_prefills()
+        # Categorize queries in queue
+        decode_queries = []
+        ongoing_prefill_queries = []
+        new_prefill_queries = []
+        for query in self.query_queue:
+            if query.prompt_length == query.prefilled and not query.decode_in_progress:
+                decode_queries.append(query)
+            elif query.prefilled + query.prefilling_in_progress > 0 and query.prompt_length > query.prefilled + query.prefilling_in_progress:
+                ongoing_prefill_queries.append(query)
+            elif query.prefilled + query.prefilling_in_progress == 0:
+                new_prefill_queries.append(query)
 
+        cur_worker = self.workers[0]
+        # Distribute decode tasks
+        while decode_queries:
+            # Find next available worker
+            while cur_worker.total_tokens >= cur_worker.capacity or cur_worker.processing:
+                if cur_worker.worker_id + 1 >= len(self.workers):
+                    self._dispatch_workers()
+                    return
+                cur_worker = self.workers[cur_worker.worker_id + 1]
+
+            cur_query = decode_queries.pop(0)
+
+            if cur_query.decoded >= cur_query.token_budget:
+                raise RuntimeError("Finished query was not removed from queue")
+
+            cur_worker.add_query(cur_query, 'decode')
+
+        # Distribute ongoing prefill tasks
+        while ongoing_prefill_queries:
+            # Find next available worker
+            while cur_worker.total_tokens + self.chunk_size >= cur_worker.capacity or cur_worker.processing:
+                if cur_worker.worker_id + 1 >= len(self.workers):
+                    self._dispatch_workers()
+                    return
+                cur_worker = self.workers[cur_worker.worker_id + 1]
+
+            cur_query = ongoing_prefill_queries.pop(0)
+            remaining_prefill = cur_query.prompt_length - (cur_query.prefilled + cur_query.prefilling_in_progress)
+            tokens_to_prefill = min(self.chunk_size, remaining_prefill)
+
+            cur_worker.add_query(cur_query, 'prefill', tokens_to_prefill)
+
+        # Distribute new prefill tasks
+        while new_prefill_queries:
+            while cur_worker.total_tokens + self.chunk_size >= cur_worker.capacity or cur_worker.processing:
+                if cur_worker.worker_id + 1 >= len(self.workers):
+                    self._dispatch_workers()
+                    return
+                cur_worker = self.workers[cur_worker.worker_id + 1]
+
+            cur_query = new_prefill_queries[0]
+            remaining_prefill = cur_query.prompt_length - (cur_query.prefilled + cur_query.prefilling_in_progress)
+            tokens_to_prefill = min(self.chunk_size, remaining_prefill)
+
+            cur_worker.add_query(cur_query, 'prefill', tokens_to_prefill)
+
+            if cur_query.prompt_length  == cur_query.prefilled + cur_query.prefilling_in_progress:
+                # Remove query from list if all prefill chunks have been assigned
+                new_prefill_queries.pop(0)
+
+        self._dispatch_workers()
+
+
+    def _dispatch_workers(self) -> None:
+        """
+        Dispatch workers that have been assigned tasks.
+        """
         for worker in self.workers:
             if worker.processing:
                 continue
@@ -349,67 +420,6 @@ class ChunkedScheduler(Scheduler):
             else:
                 self.worker_completion_times[worker.worker_id] = float('inf')
 
-    def _distribute_decodes(self) -> None:
-        """
-        Iterate through workers and assign all pending decodes.
-        """
-        decode_queries = []
-        for query in self.query_queue:
-            if query.prompt_length == query.prefilled:
-                decode_queries.append(query)
-        
-        for worker in self.workers:
-            if not worker.processing:
-                # Continue adding tokens until reaching worker capacity or running out of decodes
-                while decode_queries and worker.total_tokens + 1 < worker.capacity:
-                    cur_query = decode_queries.pop(0)
-
-                    if cur_query.decoded >= cur_query.token_budget:
-                        raise RuntimeError("Finished query was not removed from queue")
-
-                    worker.add_query(cur_query, 'decode')
-
-    def _distribute_ongoing_prefills(self) -> None:
-        """
-        Iterate through workers and assign another prefill chunk for queries that have started prefill.
-        """
-        ongoing_prefill_queries = []
-        for query in self.query_queue:
-            if query.prefilled + query.prefilling_in_progress > 0 and query.prompt_length > query.prefilled + query.prefilling_in_progress:
-                ongoing_prefill_queries.append(query)
-        
-        for worker in self.workers:
-            if not worker.processing:
-                # Continue adding chunks until reaching worker capacity or running out of ongoing prefills
-                while ongoing_prefill_queries and worker.total_tokens + self.chunk_size < worker.capacity:
-                    cur_query = ongoing_prefill_queries.pop(0)
-                    remaining_prefill = cur_query.prompt_length - (cur_query.prefilled + cur_query.prefilling_in_progress)
-                    tokens_to_prefill = min(self.chunk_size, remaining_prefill)
-
-                    worker.add_query(cur_query, 'prefill', tokens_to_prefill)
-
-    def _distribute_new_prefills(self) -> None:
-        """
-        Iterate through workers and start prefill for new queries until all workers are busy.
-        """
-        new_prefill_queries = []
-        for query in self.query_queue:
-            if query.prefilled == 0:
-                new_prefill_queries.append(query)
-
-        for worker in self.workers:
-            if not worker.processing:
-                # Continue adding chunks until reaching worker capacity or running out of prefills
-                while new_prefill_queries and worker.total_tokens + self.chunk_size < worker.capacity:
-                    cur_query = new_prefill_queries[0]
-                    remaining_prefill = cur_query.prompt_length - (cur_query.prefilled + cur_query.prefilling_in_progress)
-                    tokens_to_prefill = min(self.chunk_size, remaining_prefill)
-
-                    worker.add_query(cur_query, 'prefill', tokens_to_prefill)
-
-                    if cur_query.prompt_length  == cur_query.prefilled + cur_query.prefilling_in_progress:
-                        # Remove query from list if all prefill chunks have been assigned
-                        new_prefill_queries.pop(0)
 
     def _handle_worker_completion(self, worker: 'Worker') -> None:
         """
@@ -430,60 +440,45 @@ class ChunkedScheduler(Scheduler):
 
 def main():
     # User defined constants for simulation
-    # mean_marginal_cost = float(input("Mean Marginal Batch Cost (ms/token): "))
-    # mean_fixed_cost = float(input("Mean Fixed Batch Cost (ms): "))
-    # min_batch_threshold = int(input("Minimum Batch Threshold (tokens): "))
-    # max_batch_size = int(input("Maximum Batch Size (tokens): "))
-    # query_arrival_rate = float(input("Query Arrival Rate (Queries/s): "))/1000
-    # num_workers = int(input("Number of GPU Workers: "))
-    # chunk_size = int(input("Chunk Size: "))
-    # num_events_to_simulate = int(input("Events per Trial: "))
-    # replications = int(input("Number of Trials: "))
-    mean_marginal_cost = 0.3
-    mean_fixed_cost = 45.5
-    min_batch_threshold = 64
-    max_batch_size = 512
-    query_arrival_rate = 1/1000
-    num_workers = 1
-    chunk_size = 10
-
-    replications = 100
-    num_events_to_simulate = 100000
+    mean_marginal_cost = float(input("Mean Marginal Batch Cost (ms/token): "))
+    mean_fixed_cost = float(input("Mean Fixed Batch Cost (ms): "))
+    min_batch_threshold = int(input("Minimum Batch Threshold (tokens): "))
+    max_batch_size = int(input("Maximum Batch Size (tokens): "))
+    query_arrival_rate = float(input("Query Arrival Rate (Queries/s): "))/1000
+    num_workers = int(input("Number of GPU Workers: "))
+    chunk_size = int(input("Chunk Size: "))
+    num_queries_to_simulate = int(input("Queries per Trial: "))
+    replications = int(input("Number of Trials: "))
+    basic = input("Basic Scheduler? (y/n): ")
+    if basic == 'y':
+        basic = True
+    else:
+        basic = False
 
     df_data = []
-    chunked_df_data = []
     for r in range(replications):
+        np.random.seed(r)
         if r % 10 == 0:
-            print("Progress:", r/replications)
-        basic_scheduler = Scheduler(num_workers, mean_marginal_cost, mean_fixed_cost, min_batch_threshold, max_batch_size, query_arrival_rate)
-        chunked_scheduler = ChunkedScheduler(num_workers, mean_marginal_cost, mean_fixed_cost, min_batch_threshold, max_batch_size, query_arrival_rate,chunk_size)
+            print(f"Progress: {r/replications * 100:.2f}%")
+        if basic:
+            basic_scheduler = Scheduler(num_workers, mean_marginal_cost, mean_fixed_cost, min_batch_threshold, max_batch_size, query_arrival_rate)
+        else:
+            scheduler = ChunkedScheduler(num_workers, mean_marginal_cost, mean_fixed_cost, min_batch_threshold, max_batch_size, query_arrival_rate,chunk_size)
 
-        for _ in range(num_events_to_simulate):
-            basic_scheduler.simulate_event()
-            chunked_scheduler.simulate_event()
+        
+        while len(scheduler.completed_queries) < num_queries_to_simulate:
+            scheduler.simulate_event()
 
-        queries = basic_scheduler.completed_queries
-        chunked_queries = chunked_scheduler.completed_queries
+        queries = scheduler.completed_queries
+        print(f"Queries Completed: {len(queries)}")
 
         # Prepare data for DataFrame
         for query in queries:
             # Calculate average TBT if TBT list is not empty, otherwise 0
             avg_tbt = np.mean(query.time_between_tokens) if query.time_between_tokens else 0.0
             df_data.append({
-                'replication': r,
-                'arrival_time': query.arrival_time,
-                'finish_time': query.finish_time,
-                'TTFT': query.time_to_first_token,
-                'TBT_average': avg_tbt,
-                'prefill': query.prompt_length,
-                'decode': query.token_budget
-            })
-
-        # Prepare data for DataFrame
-        for query in chunked_queries:
-            # Calculate average TBT if TBT list is not empty, otherwise 0
-            avg_tbt = np.mean(query.time_between_tokens) if query.time_between_tokens else 0.0
-            chunked_df_data.append({
+                'chunk_size': chunk_size,
+                'num_workers': num_workers,
                 'replication': r,
                 'arrival_time': query.arrival_time,
                 'finish_time': query.finish_time,
@@ -494,15 +489,11 @@ def main():
             })
 
     # Create DataFrame
-    basic_scheduler_df = pd.DataFrame(df_data)
-    chunked_scheduler_df = pd.DataFrame(chunked_df_data)
+    scheduler_df = pd.DataFrame(df_data)
 
     # Save to CSV
-    csv_filename = "basic_scheduler_metrics.csv"
-    basic_scheduler_df.to_csv(csv_filename, index=False)
-
-    csv_filename = "chunked_scheduler_metrics.csv"
-    chunked_scheduler_df.to_csv(csv_filename, index=False)
+    csv_filename = "chunked_scheduler_metrics_3.csv"
+    scheduler_df.to_csv(csv_filename, index=False)
 
 if __name__ == "__main__":
     main()
